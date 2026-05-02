@@ -2,6 +2,10 @@ import logging
 import re
 import ast
 import operator
+import json
+import os
+import time
+import textwrap
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -14,14 +18,59 @@ from telegram.ext import (
 from tavily import TavilyClient
 from g4f.client import Client as G4FClient
 import requests
+from langdetect import detect, DetectorFactory
+
+# Фиксируем seed для langdetect
+DetectorFactory.seed = 0
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
 TAVILY_API_KEY = "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"
 BOT_TOKEN = "8541046578:AAHcYxpX12EMIDXl8c5ZyigQnIutuvOIe7I"
-ADMIN_CHAT_ID = 5078387190  # <-- заменить на реальный ID администратора
+ADMIN_CHAT_ID = 5078387190  # Замените на ваш реальный ID
+
+USERS_FILE = "users.json"
+ADMIN_REPLIES_FILE = "admin_replies.json"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# -------------------- РАБОТА С ФАЙЛАМИ --------------------
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+def save_users(users):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(users), f, ensure_ascii=False)
+
+def add_user(user_id):
+    users = load_users()
+    if user_id not in users:
+        users.add(user_id)
+        save_users(users)
+
+def load_admin_replies():
+    if os.path.exists(ADMIN_REPLIES_FILE):
+        with open(ADMIN_REPLIES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_admin_replies(replies):
+    with open(ADMIN_REPLIES_FILE, "w", encoding="utf-8") as f:
+        json.dump(replies, f, ensure_ascii=False)
+
+def add_admin_reply(admin_msg_id, user_id):
+    replies = load_admin_replies()
+    replies[str(admin_msg_id)] = user_id
+    save_admin_replies(replies)
+
+def pop_admin_reply(admin_msg_id):
+    replies = load_admin_replies()
+    user_id = replies.pop(str(admin_msg_id), None)
+    save_admin_replies(replies)
+    return user_id
 
 # -------------------- КНОПКИ --------------------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -75,7 +124,7 @@ class SearchEngine:
             return None
         return data.get("answer")
 
-# -------------------- ИИ-МОДУЛЬ (g4f) --------------------
+# -------------------- ИИ-МОДУЛЬ С УЛУЧШЕННЫМ ПЕРЕВОДОМ --------------------
 class AIChat:
     SYSTEM_PROMPT = (
         "Ты полезный ассистент. Отвечай кратко, по делу и ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
@@ -85,6 +134,77 @@ class AIChat:
 
     def __init__(self):
         self.g4f_client = G4FClient()
+        self.max_retries = 2
+
+    def _is_likely_russian(self, text: str) -> bool:
+        if not text:
+            return False
+        try:
+            lang = detect(text)
+            return lang == 'ru'
+        except:
+            russian_letters = len(re.findall(r'[а-яё]', text.lower()))
+            total_letters = len(re.findall(r'[a-zа-яё]', text.lower()))
+            if total_letters == 0:
+                return False
+            return (russian_letters / total_letters) >= 0.3
+
+    def _call_g4f(self, messages, **kwargs):
+        for attempt in range(self.max_retries):
+            try:
+                response = self.g4f_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    **kwargs
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.error(f"G4F attempt {attempt+1} failed: {e}")
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(1)
+
+    def translate_to_russian(self, text: str) -> str:
+        if not text or self._is_likely_russian(text):
+            return text
+
+        MAX_CHUNK_SIZE = 1800
+        if len(text) > MAX_CHUNK_SIZE:
+            chunks = textwrap.wrap(text, MAX_CHUNK_SIZE, break_long_words=False)
+            translated_chunks = [self._translate_single_chunk(chunk) for chunk in chunks]
+            return " ".join(translated_chunks)
+        else:
+            return self._translate_single_chunk(text)
+
+    def _translate_single_chunk(self, chunk: str) -> str:
+        system_prompt = (
+            "Ты профессиональный лингвист и переводчик. Твоя задача — перевести ЛЮБОЙ текст на русский язык "
+            "максимально точно, естественно и с сохранением стиля. Учитывай идиомы, сленг, культурные отсылки, "
+            "терминологию. Если в тексте есть аббревиатуры, расшифровывай их. Отвечай ТОЛЬКО переводом, без "
+            "пояснений, без кавычек, без дополнительных слов."
+        )
+        user_prompt = f"Переведи на русский язык:\n{chunk}"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        try:
+            translated = self._call_g4f(messages, max_tokens=2000, temperature=0.0)
+            if translated and len(translated) > len(chunk) * 0.3:
+                return self._postprocess_translation(translated)
+            else:
+                return chunk
+        except Exception as e:
+            logger.warning(f"Translation failed: {e}")
+            return chunk
+
+    def _postprocess_translation(self, text: str) -> str:
+        text = re.sub(r'^(Перевод|Ответ|Результат|Текст)\s*[:;]\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'^[\'"“”«»]+|[\'"“”«»]+$', '', text).strip()
+        text = re.sub(r'\s+', ' ', text)
+        return text
 
     def ask_with_context(self, history: list[dict], user_msg: str, snippets: list[str] | None = None) -> str:
         messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
@@ -95,35 +215,13 @@ class AIChat:
         messages.append({"role": "user", "content": user_msg})
 
         try:
-            response = self.g4f_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=800,
-                temperature=0.3 if snippets else 0.7,
-            )
-            text = response.choices[0].message.content.strip()
-            if not is_russian(text):
+            text = self._call_g4f(messages, max_tokens=800, temperature=0.3 if snippets else 0.7)
+            if text and not self._is_likely_russian(text):
                 text = self.translate_to_russian(text)
             return text
         except Exception as e:
-            logger.error(f"G4F error: {e}")
+            logger.error(f"G4F error after retries: {e}")
             return "Извините, сейчас ИИ недоступен."
-
-    def translate_to_russian(self, text: str) -> str:
-        try:
-            response = self.g4f_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Переводи любой текст на русский язык точно и кратко."},
-                    {"role": "user", "content": f"Переведи на русский:\n{text}"},
-                ],
-                max_tokens=500,
-                temperature=0.1,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Translation error: {e}")
-            return text
 
 # -------------------- ПОГОДА --------------------
 def get_weather(city: str) -> str:
@@ -165,9 +263,6 @@ def safe_eval(expr: str) -> str:
         return "Ошибка в выражении. Пример: 2+2*3"
 
 # -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
-def is_russian(text: str) -> bool:
-    return bool(re.search(r"[а-яё]", text, re.IGNORECASE))
-
 def is_greeting(text: str) -> bool:
     greeting_words = r"\b(привет|здравствуй|добрый день|доброе утро|добрый вечер|здарова|хай|хелло|hi|hello)\b"
     if re.search(greeting_words, text, re.IGNORECASE):
@@ -195,14 +290,18 @@ async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
     data = engine.search(query)
 
     direct = engine.extract_direct_answer(data)
-    if direct:
-        if not is_russian(direct):
-            ai = AIChat()
+    if direct and len(direct) > 10:
+        ai = AIChat()
+        if not ai._is_likely_russian(direct):
             direct = ai.translate_to_russian(direct)
         await msg.reply_text(direct)
         return
 
     snippets = [r.get("content", "") for r in data.get("results", []) if r.get("content")]
+    if not snippets:
+        await msg.reply_text("❌ Ничего не найдено по вашему запросу. Попробуйте переформулировать.")
+        return
+
     ai = AIChat()
     history = context.user_data.get("chat_history", [])
     answer = ai.ask_with_context(history, query, snippets)
@@ -214,6 +313,9 @@ async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
 
 # -------------------- КОМАНДЫ --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    add_user(user_id)
+
     bot_name = get_bot_name(context)
     if not bot_name:
         context.user_data["waiting_for_name"] = True
@@ -267,7 +369,7 @@ async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     ai = AIChat()
     joke_text = ai.ask_with_context([], "Расскажи короткую смешную шутку на русском языке")
-    if not is_russian(joke_text):
+    if not ai._is_likely_russian(joke_text):
         joke_text = ai.translate_to_russian(joke_text)
     await update.message.reply_text(joke_text)
 
@@ -306,6 +408,33 @@ async def reset_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("chat_history", None)
     await update.message.reply_text("🧠 История диалога очищена.")
 
+# -------------------- АДМИНИСТРАТОР: РАССЫЛКА --------------------
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ У вас нет прав для этой команды.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("📢 Использование: /broadcast <текст сообщения>")
+        return
+
+    broadcast_text = " ".join(context.args)
+    users = load_users()
+    sent = 0
+    failed = 0
+
+    await update.message.reply_text(f"Начинаю рассылку для {len(users)} пользователей...")
+
+    for user_id in users:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"📣 **Рассылка от администратора:**\n{broadcast_text}", parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+            failed += 1
+
+    await update.message.reply_text(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+
 # -------------------- ОБРАБОТЧИК INLINE-КНОПОК --------------------
 async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -314,7 +443,6 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "end_session":
         await query.edit_message_text("👋 Сеанс завершён. Продолжайте пользоваться ботом через основные кнопки или текстом.")
-        # Очищаем все состояния ожидания
         context.user_data.pop("expecting_weather", None)
         context.user_data.pop("expecting_translate", None)
         context.user_data.pop("expecting_calc", None)
@@ -339,7 +467,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Сейчас придумаю шутку...")
         ai = AIChat()
         joke_text = ai.ask_with_context([], "Расскажи короткую смешную шутку на русском языке")
-        if not is_russian(joke_text):
+        if not ai._is_likely_russian(joke_text):
             joke_text = ai.translate_to_russian(joke_text)
         await query.edit_message_text(joke_text)
     elif data == "func_calc":
@@ -371,13 +499,15 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="Markdown",
         )
 
-# -------------------- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ --------------------
+# -------------------- ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ --------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    add_user(user_id)
+
     text = update.message.text.strip()
     if not text:
         return
 
-    # Обработка ожиданий специальных вводов
     if context.user_data.get("expecting_weather"):
         context.user_data.pop("expecting_weather", None)
         city = text
@@ -402,19 +532,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("waiting_for_bug_report"):
         context.user_data.pop("waiting_for_bug_report", None)
-        # Пересылаем сообщение админу
         user = update.effective_user
         user_info = f"От: {user.full_name} (@{user.username}, id: {user.id})"
         bug_text = f"📩 Сообщение об ошибке\n{user_info}\n\n{text}"
         try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=bug_text)
-            await update.message.reply_text("✅ Спасибо! Ваше сообщение отправлено администратору.")
+            admin_msg = await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=bug_text)
+            add_admin_reply(admin_msg.message_id, user_id)
+            await update.message.reply_text("✅ Спасибо! Ваше сообщение отправлено администратору. Когда он ответит, вы получите уведомление.")
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение админу: {e}")
             await update.message.reply_text("❌ Не удалось отправить сообщение. Попробуйте позже.")
         return
 
-    # Ожидание имени для бота
     if is_waiting_for_name(context):
         if len(text) > 20:
             await update.message.reply_text("Имя слишком длинное. До 20 символов.")
@@ -433,7 +562,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot_name = get_bot_name(context)
 
-    # Обработка кнопок основной клавиатуры
     if text == "Начать разговор":
         if not bot_name:
             await update.message.reply_text("Сначала дайте мне имя через /start.")
@@ -468,7 +596,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Приветствие
     if is_greeting(text):
         if bot_name:
             await update.message.reply_text(
@@ -481,7 +608,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Если бот ещё не назван – просим имя
     if not bot_name:
         context.user_data["waiting_for_name"] = True
         await update.message.reply_text(
@@ -489,7 +615,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Режим общения или поиска
     if get_chat_mode(context):
         await update.message.chat.send_action("typing")
         ai = AIChat()
@@ -501,6 +626,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["chat_history"] = history[-40:]
     else:
         await process_search(update, context, text)
+
+# -------------------- ОБРАБОТЧИК ОТВЕТОВ АДМИНИСТРАТОРА --------------------
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+
+    if not update.message.reply_to_message:
+        return
+
+    replied_msg = update.message.reply_to_message
+    if replied_msg.from_user.id != context.bot.id:
+        return
+
+    user_id = pop_admin_reply(replied_msg.message_id)
+    if user_id is None:
+        await update.message.reply_text("❌ Не удалось определить пользователя для ответа. Возможно, ответ уже был отправлен.")
+        return
+
+    reply_text = update.message.text
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📨 **Ответ от администратора:**\n{reply_text}",
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(f"✅ Ответ отправлен пользователю (id: {user_id}).")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке ответа пользователю {user_id}: {e}")
+        await update.message.reply_text(f"❌ Не удалось отправить ответ пользователю {user_id}.")
 
 # -------------------- ЗАПУСК --------------------
 def main():
@@ -515,9 +669,11 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("reset", reset_dialog))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
 
     app.add_handler(CallbackQueryHandler(handle_inline_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Chat(chat_id=ADMIN_CHAT_ID) & filters.TEXT & ~filters.COMMAND, handle_admin_reply), group=1)
 
     logger.info("Simul BM 100 запущен...")
     app.run_polling()

@@ -1,4 +1,6 @@
-python-telegram-bot
-tavily-python
-g4f
-requests
+python-telegram-bot>=21.9
+tavily-python>=0.7.13
+g4f>=0.4.0.0
+requests>=2.32.3
+langdetect>=1.0.9
+curl_cffi>=0.7.3
