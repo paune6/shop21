@@ -25,7 +25,7 @@ DetectorFactory.seed = 0
 
 # -------------------- КОНФИГУРАЦИЯ --------------------
 TAVILY_API_KEY = "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"
-BOT_TOKEN = ""
+BOT_TOKEN = "8541046578:AAHcYxpX12EMIDXl8c5ZyigQnIutuvOIe7I"
 ADMIN_CHAT_ID = 5078387190  # Замените на ваш реальный ID
 
 USERS_FILE = "users.json"
